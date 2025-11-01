@@ -1,0 +1,4 @@
+-------------------------------------------------------------------------------
+Test set: com.nice.avishkar.TravelOptimizerTest
+-------------------------------------------------------------------------------
+Tests run: 7, Failures: 0, Errors: 0, Skipped: 1, Time elapsed: 45.233 s - in com.nice.avishkar.TravelOptimizerTest

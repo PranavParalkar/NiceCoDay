@@ -14,10 +14,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.PriorityQueue;
-import java.util.Set;
 import java.util.Comparator;
 
 
@@ -32,119 +30,122 @@ public class TravelOptimizerImpl implements ITravelOptimizer {
     }
 
     public Map<String, OptimalTravelSchedule> getOptimalTravelOptions(ResourceInfo resourceInfo) throws IOException {
-        // Read schedules and customer requests
         List<ScheduleRecord> schedules = readSchedules(resourceInfo.getTransportSchedulePath());
         List<CustomerRequest> requests = readRequests(resourceInfo.getCustomerRequestPath());
 
-        // index schedules
         Map<Integer, ScheduleRecord> idxToSchedule = new HashMap<>();
         for (int i = 0; i < schedules.size(); i++) idxToSchedule.put(i, schedules.get(i));
 
-        // build adjacency of schedule indices by source -> list
         Map<String, List<Integer>> departuresFrom = new HashMap<>();
         for (int i = 0; i < schedules.size(); i++) {
             departuresFrom.computeIfAbsent(schedules.get(i).source, k -> new ArrayList<>()).add(i);
         }
 
-        Map<String, OptimalTravelSchedule> result = new HashMap<>();
+        java.util.concurrent.ConcurrentMap<String, OptimalTravelSchedule> result = new java.util.concurrent.ConcurrentHashMap<>();
 
-        for (CustomerRequest req : requests) {
+        requests.parallelStream().forEach(req -> {
             String reqId = req.requestId;
             String criteria = req.criteria == null ? "Time" : req.criteria;
 
-            // trivial same-source-destination
             if (req.source.equals(req.destination)) {
                 result.put(reqId, new OptimalTravelSchedule(new ArrayList<>(), criteria, 0, "Not generated"));
-                continue;
+                return;
             }
 
-            // prepare start trip indices
             List<Integer> starts = departuresFrom.getOrDefault(req.source, new ArrayList<>());
 
-            // if no starting trips -> no route
             if (starts.isEmpty()) {
                 String summary = generateSummary ? "No routes available" : "Not generated";
                 result.put(reqId, new OptimalTravelSchedule(new ArrayList<>(), criteria, 0, summary));
-                continue;
+                return;
             }
 
-            // priority queue of states
             Comparator<State> comp = getComparator(criteria);
             PriorityQueue<State> pq = new PriorityQueue<>(comp);
 
-            // initialize
             for (int si : starts) {
                 ScheduleRecord s = idxToSchedule.get(si);
                 long dep = s.departure;
                 long arr = s.arrivalAdjusted();
-                State st = new State(si, si, dep, arr, s.cost, 1, new ArrayList<>());
-                st.path.add(s.toRoute());
+                java.util.BitSet used = new java.util.BitSet(schedules.size());
+                used.set(si);
+                State st = new State(si, si, dep, arr, s.cost, 1, null, used);
                 pq.add(st);
             }
 
             State best = null;
-            Set<String> visitedSignatures = new HashSet<>();
-            final int MAX_HOPS = 6; // pragmatic cap to avoid explosion; covers most realistic itineraries
+            java.util.Set<Long> visitedSignatures = new java.util.HashSet<>();
+            final int MAX_HOPS_LOCAL = 4; 
+            final int MAX_EXPANSIONS_LOCAL = 1000;
 
-            // BFS/Dijkstra with state including absolute times. Limit path length to schedules size to avoid cycles.
+            Map<Integer, List<long[]>> bestSignatures = new HashMap<>();
+            final int MAX_LABELS_PER_NODE_LOCAL = 1;
+
+
+            int expansions = 0;
             while (!pq.isEmpty()) {
                 State cur = pq.poll();
 
-                // pruning: avoid overly long paths
-                if (cur.hops > MAX_HOPS) continue;
+                if (++expansions > MAX_EXPANSIONS_LOCAL) break; 
+                if (best != null && comp.compare(cur, best) >= 0) break;
+                if (cur.hops > MAX_HOPS_LOCAL) continue;
 
                 ScheduleRecord lastRec = idxToSchedule.get(cur.lastIdx);
-
-                // if reached destination
                 if (lastRec.destination.equals(req.destination)) {
                     if (best == null || comp.compare(cur, best) < 0) {
                         best = cur;
                     }
-                    // continue searching because equal primary might have better tie-breakers
                     continue;
                 }
 
-                // expand outgoing trips from current location
                 List<Integer> nextList = departuresFrom.getOrDefault(lastRec.destination, new ArrayList<>());
                 for (int ni : nextList) {
                     ScheduleRecord nextRec = idxToSchedule.get(ni);
 
-                    // avoid reusing the same schedule record in path (simple cycle prevention)
                     boolean already = cur.usedContains(ni);
                     if (already) continue;
 
-                    // compute next departure absolute >= cur.arrival
                     long baseDep = nextRec.departure;
                     long baseArr = nextRec.arrival;
                     long candidateDep = baseDep;
                     long prevArr = cur.arrivalAbs;
                     if (candidateDep < (prevArr % 1440)) {
-                        // need to shift forward by at least one day relative to prevArr
-                        long k = (prevArr - candidateDep + 1439) / 1440; // ceil
+                        long k = (prevArr - candidateDep + 1439) / 1440; 
                         candidateDep = candidateDep + k * 1440;
                     } else {
-                        // candidateDep base might be >= prevArr%1440 but actual prevArr could be in later day
                         long dayOffset = (prevArr / 1440) * 1440;
                         candidateDep = candidateDep + dayOffset;
                         if (candidateDep < prevArr) candidateDep += 1440;
                     }
 
                     long candidateArr = candidateDep + ((baseArr >= baseDep) ? (baseArr - baseDep) : (baseArr + 1440 - baseDep));
+                    java.util.BitSet nUsed = (java.util.BitSet) cur.usedIndices.clone();
+                    nUsed.set(ni);
+                    State nxt = new State(cur.startIdx, ni, cur.firstDepartureAbs, candidateArr, cur.totalCost + nextRec.cost, cur.hops + 1, cur, nUsed);
 
-                    // build new state
-                    State nxt = cur.copy();
-                    nxt.lastIdx = ni;
-                    nxt.arrivalAbs = candidateArr;
-                    nxt.totalCost += nextRec.cost;
-                    nxt.hops += 1;
-                    nxt.path.add(nextRec.toRoute());
-                    nxt.usedIndices.add(ni);
-
-                    // signature to avoid repeating same (lastIdx, arrivalAbs modulo maybe 1440 and hops)
-                    String sig = ni + "@" + (candidateArr % 1440) + "#" + nxt.hops;
+                    long sig = (((long) ni) << 48) ^ (candidateArr & 0x0000FFFFFFFFFFFFL) ^ (((long) nxt.hops) << 40);
                     if (visitedSignatures.contains(sig)) continue;
-                    visitedSignatures.add(sig);
 
+                    long[] curSig = new long[] { candidateArr, nxt.totalCost, nxt.hops };
+                    List<long[]> list = bestSignatures.get(ni);
+                    if (isDominatedPrimitive(list, curSig)) continue;
+
+                    if (list == null) list = new ArrayList<>();
+                    List<long[]> keep = new ArrayList<>();
+                    for (long[] s : list) {
+                        if (!dominatesPrimitive(curSig, s)) keep.add(s);
+                    }
+                    keep.add(curSig);
+                    if (keep.size() > MAX_LABELS_PER_NODE_LOCAL) {
+                        int worstIdx = 0;
+                        for (int i = 1; i < keep.size(); i++) {
+                            if (compareSignaturesPrimitive(keep.get(i), keep.get(worstIdx), criteria) > 0) worstIdx = i;
+                        }
+                        keep.remove(worstIdx);
+                    }
+                    bestSignatures.put(ni, keep);
+
+                    visitedSignatures.add(sig);
                     pq.add(nxt);
                 }
             }
@@ -153,11 +154,20 @@ public class TravelOptimizerImpl implements ITravelOptimizer {
                 String summary = generateSummary ? "No routes available" : "Not generated";
                 result.put(reqId, new OptimalTravelSchedule(new ArrayList<>(), criteria, 0, summary));
             } else {
+                List<Route> routes = new ArrayList<>();
+                State cur = best;
+                while (cur != null) {
+                    if (cur.lastIdx >= 0) {
+                        ScheduleRecord sr = idxToSchedule.get(cur.lastIdx);
+                        if (sr != null) routes.add(0, sr.toRoute());
+                    }
+                    cur = cur.parent;
+                }
                 long primaryValue = computePrimaryValue(best, criteria);
-                String summary = generateSummary ? generateSummaryText(best, criteria) : "Not generated";
-                result.put(reqId, new OptimalTravelSchedule(best.path, criteria, primaryValue, summary));
+                String summary = generateSummary ? generateSummaryText(routes, criteria) : "Not generated";
+                result.put(reqId, new OptimalTravelSchedule(routes, criteria, primaryValue, summary));
             }
-        }
+        });
 
         return result;
     }
@@ -204,13 +214,18 @@ public class TravelOptimizerImpl implements ITravelOptimizer {
         }
     }
 
-    private String generateSummaryText(State best, String criteria) {
-        // try to call HuggingFace only if HF_API_KEY env set
+    private String generateSummaryText(List<Route> path, String criteria) {
         String apiKey = System.getenv("HF_API_KEY");
-        String prompt = buildPromptFromState(best, criteria);
+        String prompt = buildPromptFromPath(path, criteria);
         if (apiKey == null || apiKey.isEmpty()) {
-            // fallback short summary
-            long duration = best.arrivalAbs - best.firstDepartureAbs;
+            long duration = 0;
+            if (path != null && !path.isEmpty()) {
+                try {
+                    long start = parseTime(path.get(0).getDepartureTime());
+                    long end = parseTime(path.get(path.size()-1).getArrivalTime());
+                    duration = end >= start ? (end - start) : (end + 1440 - start);
+                } catch (Exception ex) { duration = 0; }
+            }
             return "Total travel time " + duration + " minutes. Optimal by " + criteria + ".";
         }
 
@@ -246,17 +261,26 @@ public class TravelOptimizerImpl implements ITravelOptimizer {
         } catch (Exception ex) {
             // ignore and fallback
         }
-        long duration = best.arrivalAbs - best.firstDepartureAbs;
+        long duration = 0;
+        if (path != null && !path.isEmpty()) {
+            try {
+                long start = parseTime(path.get(0).getDepartureTime());
+                long end = parseTime(path.get(path.size()-1).getArrivalTime());
+                duration = end >= start ? (end - start) : (end + 1440 - start);
+            } catch (Exception ex) { duration = 0; }
+        }
         return "Total travel time " + duration + " minutes. Optimal by " + criteria + ".";
     }
 
-    private String buildPromptFromState(State best, String criteria) {
+    private String buildPromptFromPath(List<Route> path, String criteria) {
         StringBuilder sb = new StringBuilder();
         sb.append("You are a travel assistant. Provide a one-sentence (<=60 words) summary for this itinerary. Criteria: ").append(criteria).append(".\n");
         sb.append("Legs:\n");
-        for (Route r : best.path) {
-            sb.append(r.getSource()).append("->").append(r.getDestination()).append(" (")
-                    .append(r.getDepartureTime()).append("-").append(r.getArrivalTime()).append(")\n");
+        if (path != null) {
+            for (Route r : path) {
+                sb.append(r.getSource()).append("->").append(r.getDestination()).append(" (")
+                        .append(r.getDepartureTime()).append("-").append(r.getArrivalTime()).append(")\n");
+            }
         }
         return sb.toString();
     }
@@ -294,15 +318,14 @@ public class TravelOptimizerImpl implements ITravelOptimizer {
         return out;
     }
 
-    // --- helper classes ---
     static class ScheduleRecord {
         String source;
         String destination;
         String mode;
         String departureTime;
         String arrivalTime;
-        long departure; // minutes from 0
-        long arrival; // minutes from 0
+        long departure; 
+        long arrival;
         long cost;
 
         ScheduleRecord(String s, String d, String m, String dep, String arr, long cost) {
@@ -343,32 +366,50 @@ public class TravelOptimizerImpl implements ITravelOptimizer {
         long firstDepartureAbs;
         long arrivalAbs;
         long totalCost;
-        int hops;
-        List<Route> path;
-        Set<Integer> usedIndices;
+    int hops;
+    State parent;
+    java.util.BitSet usedIndices;
 
-        State(int startIdx, int lastIdx, long firstDepartureAbs, long arrivalAbs, long totalCost, int hops, List<Route> path) {
-            this.startIdx = startIdx; this.lastIdx = lastIdx; this.firstDepartureAbs = firstDepartureAbs; this.arrivalAbs = arrivalAbs; this.totalCost = totalCost; this.hops = hops; this.path = path;
-            this.usedIndices = new HashSet<>();
-            this.usedIndices.add(startIdx);
-        }
-
-        State copy() {
-            List<Route> np = new ArrayList<>(this.path);
-            State s = new State(this.startIdx, this.lastIdx, this.firstDepartureAbs, this.arrivalAbs, this.totalCost, this.hops, np);
-            s.usedIndices = new HashSet<>(this.usedIndices);
-            return s;
+        State(int startIdx, int lastIdx, long firstDepartureAbs, long arrivalAbs, long totalCost, int hops, State parent, java.util.BitSet usedIndices) {
+            this.startIdx = startIdx; this.lastIdx = lastIdx; this.firstDepartureAbs = firstDepartureAbs; this.arrivalAbs = arrivalAbs; this.totalCost = totalCost; this.hops = hops; this.parent = parent; this.usedIndices = usedIndices;
         }
 
         boolean usedContains(int idx) {
-            return usedIndices.contains(idx);
+            return usedIndices.get(idx);
         }
-
-        // helper to allow marking used; we won't actually use usedContains logic to block by idx because mapping is complex
     }
 
-    
-    // removed unused helper classes
+    private static boolean isDominatedPrimitive(List<long[]> list, long[] s) {
+        if (list == null) return false;
+        for (long[] e : list) {
+            if (e[0] <= s[0] && e[1] <= s[1] && e[2] <= s[2]) return true;
+        }
+        return false;
+    }
+
+    private static boolean dominatesPrimitive(long[] a, long[] b) {
+        boolean noWorse = a[0] <= b[0] && a[1] <= b[1] && a[2] <= b[2];
+        boolean strictlyBetter = a[0] < b[0] || a[1] < b[1] || a[2] < b[2];
+        return noWorse && strictlyBetter;
+    }
+
+    private static int compareSignaturesPrimitive(long[] a, long[] b, String criteria) {
+        String c = criteria == null ? "time" : criteria.toLowerCase();
+        switch (c) {
+            case "cost":
+                if (a[1] != b[1]) return Long.compare(a[1], b[1]);
+                if (a[0] != b[0]) return Long.compare(a[0], b[0]);
+                return Long.compare(a[2], b[2]);
+            case "hops":
+                if (a[2] != b[2]) return Long.compare(a[2], b[2]);
+                if (a[0] != b[0]) return Long.compare(a[0], b[0]);
+                return Long.compare(a[1], b[1]);
+            default:
+                if (a[0] != b[0]) return Long.compare(a[0], b[0]);
+                if (a[1] != b[1]) return Long.compare(a[1], b[1]);
+                return Long.compare(a[2], b[2]);
+        }
+    }
 
     private static long parseTime(String t) {
         try {
